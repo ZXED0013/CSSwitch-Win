@@ -4,7 +4,7 @@
     "id": "CHG-OPENAI-ADAPTER-RELIABILITY",
     "version": "v0.8.4-dev",
     "title": "Preserve OpenAI adapter content and require complete bounded streams",
-    "summary": "Adds shared Chat/Responses content and streaming adapters that preserve image order, signed reasoning, tool schemas and tool choice; rejects unsupported output or incomplete/trailing-error streams without retrying inference POSTs. Preserves the total response deadline despite keepalive frames. Registers focused source tests, makes two test fixture directory helpers portable, and keeps the public contribution limited to the shared Gateway.",
+    "summary": "Adds shared Chat/Responses content and streaming adapters that preserve image order, signed reasoning, tool schemas and tool choice; rejects unsupported output or incomplete/trailing-error streams without retrying inference POSTs. Preserves the total response deadline despite keepalive frames. Tool-schema validation shares a 20,000-node work budget and a 64-level depth bound across all branches, with exhaustion latched as failure even under negation or conditional schemas. Registers focused source tests, makes two test fixture directory helpers portable, and keeps the public contribution limited to the shared Gateway.",
     "status": "active",
     "owner": "gateway",
     "changed_paths": [
@@ -69,9 +69,10 @@
         "public"
       ],
       "basis": [
-        "Gateway unit tests cover content translation, signed reasoning, schema validation, clean stream termination and bounded total response deadlines.",
+        "Gateway unit tests cover content translation, signed reasoning, globally bounded schema validation, clean stream termination and bounded total response deadlines.",
         "Loopback tests use isolated local mock providers to cover JSON fallback, tool validation and image/reasoning/tool ordering without repeating inference POSTs.",
-        "The source identity fixture retains existing platform-specific identities and adds the 23 new Rust and four new Python test identities; all 16 source suite digests bind the same updated fixture.",
+        "The source identity fixture retains existing platform-specific identities and adds the 26 new Rust and four new Python test identities; all 16 source suite digests bind the same updated fixture.",
+        "Three schema-budget regression tests cover repeated branch references and reject node/depth exhaustion under not and if/else without converting resource exhaustion into validation success.",
         "No installed application, live provider, account, Science runtime, signing or public release evidence is claimed."
       ]
     },

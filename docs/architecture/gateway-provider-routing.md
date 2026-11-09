@@ -115,6 +115,10 @@ reasoning 必须完成本地签署后才输出。若先前有尚未输出的工�
 取消关闭同一上游请求。上游忽略 `stream=true` 回传 JSON 时，仅限量读取并验证该次
 响应后重播 SSE，不另发 POST。
 
+工具 schema 验证的所有组合分支、局部引用、否定与条件共享单次验证预算；
+节点总数上限为 20,000、深度上限为 64。预算超限是整次验证失败，不能被
+`not` 或条件分支解释为普通不匹配后转为成功。
+
 `response_content` 由 Chat / Responses 请求映射、Responses 结果映射及串流验证调用。
 它接受图片与 reasoning block，返回对应 OpenAI 内容或稳定错误；没有文件、进程或
 网络副作用。图片输入保留原始顺序。Responses reasoning 的完整 item（含 opaque

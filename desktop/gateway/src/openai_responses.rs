@@ -347,13 +347,16 @@ fn output_text(item: &Value) -> String {
         .join("")
 }
 
+#[derive(Default)]
 struct SchemaBudget {
     nodes: usize,
+    exhausted: bool,
 }
 
 impl SchemaBudget {
     fn enter(&mut self, depth: usize) -> bool {
-        if depth > MAX_SCHEMA_DEPTH || self.nodes >= MAX_SCHEMA_NODES {
+        if self.exhausted || depth > MAX_SCHEMA_DEPTH || self.nodes >= MAX_SCHEMA_NODES {
+            self.exhausted = true;
             return false;
         }
         self.nodes += 1;
@@ -524,23 +527,19 @@ fn validate_schema_instance(
         else {
             return false;
         };
-        let matches = branches
-            .iter()
-            .filter(|branch| {
-                let mut branch_budget = SchemaBudget {
-                    nodes: budget.nodes,
-                };
-                let mut branch_refs = ref_stack.clone();
-                validate_schema_instance(
-                    instance,
-                    branch,
-                    root,
-                    depth + 1,
-                    &mut branch_budget,
-                    &mut branch_refs,
-                )
-            })
-            .count();
+        let mut matches = 0;
+        for branch in branches {
+            // Sibling paths have independent cycle detection, but all paths
+            // consume the same budget. Copying it makes shared refs exponential.
+            let mut branch_refs = ref_stack.clone();
+            if validate_schema_instance(instance, branch, root, depth + 1, budget, &mut branch_refs)
+            {
+                matches += 1;
+            }
+            if budget.exhausted {
+                return false;
+            }
+        }
         let valid = match keyword {
             "allOf" => matches == branches.len(),
             "anyOf" => matches >= 1,
@@ -552,35 +551,29 @@ fn validate_schema_instance(
         }
     }
     if let Some(negated) = object.get("not") {
-        let mut branch_budget = SchemaBudget {
-            nodes: budget.nodes,
-        };
         let mut branch_refs = ref_stack.clone();
-        if validate_schema_instance(
-            instance,
-            negated,
-            root,
-            depth + 1,
-            &mut branch_budget,
-            &mut branch_refs,
-        ) {
+        let matches =
+            validate_schema_instance(instance, negated, root, depth + 1, budget, &mut branch_refs);
+        // Exhaustion is a protocol rejection, not a schema non-match that
+        // `not` may invert or `if` may route into a successful `else`.
+        if budget.exhausted || matches {
             return false;
         }
     }
 
     if let Some(condition) = object.get("if") {
-        let mut condition_budget = SchemaBudget {
-            nodes: budget.nodes,
-        };
         let mut condition_refs = ref_stack.clone();
         let condition_matches = validate_schema_instance(
             instance,
             condition,
             root,
             depth + 1,
-            &mut condition_budget,
+            budget,
             &mut condition_refs,
         );
+        if budget.exhausted {
+            return false;
+        }
         if let Some(branch) = object.get(if condition_matches { "then" } else { "else" }) {
             if !validate_schema_instance(instance, branch, root, depth + 1, budget, ref_stack) {
                 return false;
@@ -793,15 +786,16 @@ fn validate_schema_instance(
 }
 
 fn tool_arguments_match_schema(arguments: &Value, schema: &Value) -> bool {
-    let mut budget = SchemaBudget { nodes: 0 };
-    validate_schema_instance(
+    let mut budget = SchemaBudget::default();
+    let valid = validate_schema_instance(
         arguments,
         schema,
         schema,
         0,
         &mut budget,
         &mut HashSet::new(),
-    )
+    );
+    valid && !budget.exhausted
 }
 
 pub fn openai_to_anthropic(resp: &Value, model_id: &str) -> Value {
@@ -1174,5 +1168,92 @@ mod tests {
         assert!(anthropic_to_openai(&invalid, "fixture", false).is_err());
         invalid["system"] = json!([{"type":"image","text":"must not silently disappear"}]);
         assert!(anthropic_to_openai(&invalid, "fixture", false).is_err());
+    }
+
+    fn repeated_branch_refs(keyword: &str, depth: usize) -> Value {
+        let mut definitions = serde_json::Map::new();
+        definitions.insert("leaf".into(), json!({"type":"object"}));
+        for level in 0..depth {
+            let target = if level == 0 {
+                "leaf".to_string()
+            } else {
+                format!("n{}", level - 1)
+            };
+            let reference = json!({"$ref":format!("#/$defs/{target}")});
+            // Exactly one oneOf branch matches, but both branches must walk
+            // the shared reference. This must consume one global work budget.
+            let branches = if keyword == "oneOf" {
+                json!([reference.clone(), {"allOf":[reference, false]}])
+            } else {
+                json!([reference.clone(), reference])
+            };
+            let mut node = serde_json::Map::new();
+            node.insert(keyword.to_string(), branches);
+            definitions.insert(format!("n{level}"), Value::Object(node));
+        }
+        json!({"type":"object","$defs":definitions,"$ref":format!("#/$defs/n{}",depth - 1)})
+    }
+
+    #[test]
+    fn tool_schema_repeated_branch_references_have_a_global_work_bound() {
+        for keyword in ["anyOf", "allOf", "oneOf"] {
+            let schema = repeated_branch_refs(keyword, 14);
+            let started = std::time::Instant::now();
+            assert!(
+                !super::tool_arguments_match_schema(&json!({}), &schema),
+                "{keyword} reused branch budgets"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // Independent siblings may revisit the same local reference.
+            assert!(super::tool_arguments_match_schema(
+                &json!({}),
+                &repeated_branch_refs(keyword, 4)
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_schema_node_exhaustion_cannot_be_negated_or_select_else() {
+        let repeated = repeated_branch_refs("anyOf", 14);
+        let definitions = repeated["$defs"].clone();
+        let condition = json!({"allOf":[{"$ref":"#/$defs/n13"},false]});
+        for schema in [
+            json!({"$defs":definitions,"not":condition}),
+            json!({"$defs":definitions,"if":condition,"then":false,"else":true}),
+        ] {
+            assert!(
+                !super::tool_arguments_match_schema(&json!({}), &schema),
+                "work exhaustion was inverted into success"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schema_depth_exhaustion_cannot_be_negated_or_select_else() {
+        let mut deep = json!(true);
+        for _ in 0..super::MAX_SCHEMA_DEPTH + 1 {
+            deep = json!({"allOf":[deep]});
+        }
+        for schema in [
+            json!({"not":deep}),
+            json!({"if":deep,"then":false,"else":true}),
+        ] {
+            assert!(
+                !super::tool_arguments_match_schema(&json!({}), &schema),
+                "depth exhaustion was inverted into success"
+            );
+        }
+        assert!(super::tool_arguments_match_schema(
+            &json!({}),
+            &json!({"not":{"type":"string"}})
+        ));
+        assert!(super::tool_arguments_match_schema(
+            &json!({}),
+            &json!({"if":{"type":"object"},"then":true,"else":false})
+        ));
+        assert!(!super::tool_arguments_match_schema(
+            &json!({}),
+            &json!({"$ref":"#"})
+        ));
     }
 }
