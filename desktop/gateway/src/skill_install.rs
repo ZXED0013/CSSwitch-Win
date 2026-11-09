@@ -2943,7 +2943,7 @@ mod tests {
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        let path = PathBuf::from("/private/tmp").join(format!(
+        let path = std::env::temp_dir().join(format!(
             "csswitch-{label}-{}-{}",
             std::process::id(),
             format!(

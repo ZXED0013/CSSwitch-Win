@@ -1,3 +1,4 @@
+use crate::{openai_chat::ReasoningSigner, response_content};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
@@ -86,20 +87,30 @@ fn as_text(value: Option<&Value>) -> String {
     }
 }
 
-fn system_prompt(system: Option<&Value>) -> Option<String> {
+fn system_prompt(system: Option<&Value>) -> Result<Option<String>, String> {
     let prompt = match system {
         Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+        Some(Value::Array(items)) => {
+            let mut parts = Vec::new();
+            for item in items {
+                if item["type"] != "text" {
+                    return Err("Responses system content type is unsupported".into());
+                }
+                parts.push(
+                    item["text"]
+                        .as_str()
+                        .ok_or("Responses system text is invalid")?,
+                );
+            }
+            parts.join("\n")
+        }
+        None => String::new(),
+        _ => return Err("Responses system content is invalid".into()),
     };
     if prompt.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(prompt)
+        Ok(Some(prompt))
     }
 }
 
@@ -140,17 +151,28 @@ fn map_tools(tools: Option<&Value>, is_dashscope: bool, rule_ids: &mut Vec<Strin
     out
 }
 
-fn map_tool_choice(tool_choice: Option<&Value>, has_tools: bool) -> Option<Value> {
+fn map_tool_choice(tool_choice: Option<&Value>, tools: &[Value]) -> Result<Option<Value>, String> {
     let kind = match tool_choice {
         Some(Value::String(s)) => Some(s.as_str()),
         Some(Value::Object(obj)) => obj.get("type").and_then(Value::as_str),
         _ => None,
     };
     match kind {
-        Some("auto") => Some(Value::String("auto".to_string())),
-        Some("none") => Some(Value::String("none".to_string())),
-        _ if has_tools => Some(Value::String("auto".to_string())),
-        _ => None,
+        Some("auto") => Ok(Some(json!("auto"))),
+        Some("none") => Ok(Some(json!("none"))),
+        Some("any") if !tools.is_empty() => Ok(Some(json!("required"))),
+        Some("tool") => {
+            let name = tool_choice
+                .and_then(|c| c["name"].as_str())
+                .ok_or("Responses forced tool name is missing")?;
+            if !tools.iter().any(|t| t["name"] == name) {
+                return Err("Responses forced tool is not declared".into());
+            }
+            Ok(Some(json!({"type":"function","name":name})))
+        }
+        None if tool_choice.is_none() && !tools.is_empty() => Ok(Some(json!("auto"))),
+        None if tool_choice.is_none() => Ok(None),
+        _ => Err("Responses tool choice is unsupported".into()),
     }
 }
 
@@ -174,6 +196,28 @@ pub fn anthropic_to_openai(
     target_model: &str,
     is_dashscope: bool,
 ) -> Result<(Value, ResponsesMetadata), String> {
+    anthropic_to_openai_with_reasoning(req, target_model, is_dashscope, None)
+}
+
+fn flush_parts(items: &mut Vec<Value>, role: &Value, parts: &mut Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    let content = if parts.iter().all(|p| p["type"] == "input_text") {
+        Value::String(parts.iter().filter_map(|p| p["text"].as_str()).collect())
+    } else {
+        Value::Array(parts.clone())
+    };
+    items.push(json!({"role":role,"content":content}));
+    parts.clear();
+}
+
+pub(crate) fn anthropic_to_openai_with_reasoning(
+    req: &Value,
+    target_model: &str,
+    is_dashscope: bool,
+    signer: Option<&ReasoningSigner>,
+) -> Result<(Value, ResponsesMetadata), String> {
     let obj = req
         .as_object()
         .ok_or("request body must be a JSON object with a 'messages' array")?;
@@ -184,7 +228,11 @@ pub fn anthropic_to_openai(
     let mut rule_ids = Vec::new();
     let mut items = Vec::new();
     for message in obj.get("messages").and_then(Value::as_array).unwrap() {
-        let role = message.get("role").cloned().unwrap_or(Value::Null);
+        let role = message
+            .get("role")
+            .filter(|r| matches!(r.as_str(), Some("user" | "assistant")))
+            .cloned()
+            .ok_or("Responses history role is invalid")?;
         let content = message.get("content").unwrap_or(&Value::Null);
         if let Some(text) = content.as_str() {
             items.push(json!({"role": role, "content": text}));
@@ -192,16 +240,23 @@ pub fn anthropic_to_openai(
         }
 
         let mut text_parts = Vec::new();
-        for block in content.as_array().into_iter().flatten() {
+        for block in content
+            .as_array()
+            .ok_or("Responses history content is invalid")?
+        {
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
-                    text_parts.push(block.get("text").and_then(Value::as_str).unwrap_or(""));
+                    text_parts.push(json!({"type":"input_text","text":block.get("text").and_then(Value::as_str).ok_or("Responses history text is invalid")?}));
                 }
                 Some("tool_use") => {
-                    if !text_parts.is_empty() {
-                        items.push(json!({"role": role.clone(), "content": text_parts.join("")}));
-                        text_parts.clear();
+                    if role != "assistant"
+                        || !block["input"].is_object()
+                        || !valid_token(&block["id"])
+                        || !valid_token(&block["name"])
+                    {
+                        return Err("Responses tool history is invalid".into());
                     }
+                    flush_parts(&mut items, &role, &mut text_parts);
                     let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
                     items.push(json!({
                         "type": "function_call",
@@ -211,22 +266,29 @@ pub fn anthropic_to_openai(
                     }));
                 }
                 Some("tool_result") => {
-                    if !text_parts.is_empty() {
-                        items.push(json!({"role": role.clone(), "content": text_parts.join("")}));
-                        text_parts.clear();
+                    if role != "user" || !valid_token(&block["tool_use_id"]) {
+                        return Err("Responses tool result is invalid".into());
                     }
+                    flush_parts(&mut items, &role, &mut text_parts);
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
-                        "output": as_text(block.get("content")),
+                        "output": tool_output(block.get("content"))?,
                     }));
                 }
-                _ => {}
+                Some("image") if role == "user" => text_parts.push(response_content::image(block)?),
+                Some("thinking" | "redacted_thinking") if role == "assistant" => {
+                    flush_parts(&mut items, &role, &mut text_parts);
+                    items.push(response_content::restore_reasoning(
+                        block,
+                        target_model,
+                        signer.ok_or("Responses reasoning signer unavailable")?,
+                    )?);
+                }
+                _ => return Err("Responses history content type is unsupported".into()),
             }
         }
-        if !text_parts.is_empty() {
-            items.push(json!({"role": role, "content": text_parts.join("")}));
-        }
+        flush_parts(&mut items, &role, &mut text_parts);
     }
 
     let tools = map_tools(obj.get("tools"), is_dashscope, &mut rule_ids);
@@ -235,7 +297,7 @@ pub fn anthropic_to_openai(
     out.insert("model".to_string(), Value::String(target_model.to_string()));
     out.insert("input".to_string(), Value::Array(items));
     out.insert("stream".to_string(), Value::Bool(false));
-    if let Some(prompt) = system_prompt(obj.get("system")) {
+    if let Some(prompt) = system_prompt(obj.get("system"))? {
         out.insert("instructions".to_string(), Value::String(prompt));
     }
     if let Some(value) = max_output_tokens(
@@ -259,11 +321,11 @@ pub fn anthropic_to_openai(
             out.insert("top_p".to_string(), top_p.clone());
         }
     }
+    if let Some(mapped) = map_tool_choice(obj.get("tool_choice"), &tools)? {
+        out.insert("tool_choice".to_string(), mapped);
+    }
     if has_tools {
         out.insert("tools".to_string(), Value::Array(tools));
-    }
-    if let Some(mapped) = map_tool_choice(obj.get("tool_choice"), has_tools) {
-        out.insert("tool_choice".to_string(), mapped);
     }
     Ok((Value::Object(out), ResponsesMetadata { rule_ids }))
 }
@@ -285,13 +347,16 @@ fn output_text(item: &Value) -> String {
         .join("")
 }
 
+#[derive(Default)]
 struct SchemaBudget {
     nodes: usize,
+    exhausted: bool,
 }
 
 impl SchemaBudget {
     fn enter(&mut self, depth: usize) -> bool {
-        if depth > MAX_SCHEMA_DEPTH || self.nodes >= MAX_SCHEMA_NODES {
+        if self.exhausted || depth > MAX_SCHEMA_DEPTH || self.nodes >= MAX_SCHEMA_NODES {
+            self.exhausted = true;
             return false;
         }
         self.nodes += 1;
@@ -462,23 +527,19 @@ fn validate_schema_instance(
         else {
             return false;
         };
-        let matches = branches
-            .iter()
-            .filter(|branch| {
-                let mut branch_budget = SchemaBudget {
-                    nodes: budget.nodes,
-                };
-                let mut branch_refs = ref_stack.clone();
-                validate_schema_instance(
-                    instance,
-                    branch,
-                    root,
-                    depth + 1,
-                    &mut branch_budget,
-                    &mut branch_refs,
-                )
-            })
-            .count();
+        let mut matches = 0;
+        for branch in branches {
+            // Sibling paths have independent cycle detection, but all paths
+            // consume the same budget. Copying it makes shared refs exponential.
+            let mut branch_refs = ref_stack.clone();
+            if validate_schema_instance(instance, branch, root, depth + 1, budget, &mut branch_refs)
+            {
+                matches += 1;
+            }
+            if budget.exhausted {
+                return false;
+            }
+        }
         let valid = match keyword {
             "allOf" => matches == branches.len(),
             "anyOf" => matches >= 1,
@@ -490,35 +551,29 @@ fn validate_schema_instance(
         }
     }
     if let Some(negated) = object.get("not") {
-        let mut branch_budget = SchemaBudget {
-            nodes: budget.nodes,
-        };
         let mut branch_refs = ref_stack.clone();
-        if validate_schema_instance(
-            instance,
-            negated,
-            root,
-            depth + 1,
-            &mut branch_budget,
-            &mut branch_refs,
-        ) {
+        let matches =
+            validate_schema_instance(instance, negated, root, depth + 1, budget, &mut branch_refs);
+        // Exhaustion is a protocol rejection, not a schema non-match that
+        // `not` may invert or `if` may route into a successful `else`.
+        if budget.exhausted || matches {
             return false;
         }
     }
 
     if let Some(condition) = object.get("if") {
-        let mut condition_budget = SchemaBudget {
-            nodes: budget.nodes,
-        };
         let mut condition_refs = ref_stack.clone();
         let condition_matches = validate_schema_instance(
             instance,
             condition,
             root,
             depth + 1,
-            &mut condition_budget,
+            budget,
             &mut condition_refs,
         );
+        if budget.exhausted {
+            return false;
+        }
         if let Some(branch) = object.get(if condition_matches { "then" } else { "else" }) {
             if !validate_schema_instance(instance, branch, root, depth + 1, budget, ref_stack) {
                 return false;
@@ -731,15 +786,16 @@ fn validate_schema_instance(
 }
 
 fn tool_arguments_match_schema(arguments: &Value, schema: &Value) -> bool {
-    let mut budget = SchemaBudget { nodes: 0 };
-    validate_schema_instance(
+    let mut budget = SchemaBudget::default();
+    let valid = validate_schema_instance(
         arguments,
         schema,
         schema,
         0,
         &mut budget,
         &mut HashSet::new(),
-    )
+    );
+    valid && !budget.exhausted
 }
 
 pub fn openai_to_anthropic(resp: &Value, model_id: &str) -> Value {
@@ -811,6 +867,8 @@ pub fn openai_to_anthropic_validated(
     model_id: &str,
     known_tools: &Map<String, Value>,
 ) -> Result<Value, String> {
+    response_content::validate_output(resp)?;
+    let mut ids = HashSet::new();
     for item in resp
         .get("output")
         .and_then(Value::as_array)
@@ -818,6 +876,13 @@ pub fn openai_to_anthropic_validated(
         .flatten()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
     {
+        let id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .ok_or(TOOL_ARGUMENT_PROTOCOL_ERROR)?;
+        if !valid_token(id) || !ids.insert(id.as_str().unwrap()) {
+            return Err(TOOL_ARGUMENT_PROTOCOL_ERROR.into());
+        }
         let Some(name) = item.get("name").and_then(Value::as_str) else {
             return Err(TOOL_ARGUMENT_PROTOCOL_ERROR.to_string());
         };
@@ -838,6 +903,75 @@ pub fn openai_to_anthropic_validated(
         }
     }
     Ok(openai_to_anthropic(resp, model_id))
+}
+
+pub(crate) fn openai_to_anthropic_with_reasoning(
+    resp: &Value,
+    model_id: &str,
+    target: &str,
+    known: &Map<String, Value>,
+    signer: &ReasoningSigner,
+) -> Result<Value, String> {
+    let mut mapped = openai_to_anthropic_validated(resp, model_id, known)?;
+    let mut blocks = Vec::new();
+    for item in resp
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match item["type"].as_str() {
+            Some("reasoning") => {
+                blocks.push(response_content::reasoning_block(item, target, signer)?)
+            }
+            Some("message") => {
+                let text = output_text(item);
+                if !text.is_empty() {
+                    blocks.push(json!({"type":"text","text":text}));
+                }
+            }
+            Some("function_call") => {
+                let converted = openai_to_anthropic(&json!({"output":[item]}), model_id);
+                blocks.extend(converted["content"].as_array().unwrap().clone());
+            }
+            _ => unreachable!("output was validated"),
+        }
+    }
+    if !blocks.is_empty() {
+        mapped["content"] = Value::Array(blocks);
+    }
+    Ok(mapped)
+}
+
+pub(crate) fn validate_stream_tool(
+    name: &str,
+    raw: &str,
+    known: &Map<String, Value>,
+) -> Result<(), String> {
+    openai_to_anthropic_validated(&json!({"output":[{"type":"function_call","call_id":"stream-validation","name":name,"arguments":raw}]}), "stream", known).map(|_| ())
+}
+
+fn valid_token(value: &Value) -> bool {
+    value.as_str().is_some_and(|v| {
+        !v.is_empty() && v.len() <= 256 && !v.chars().any(|c| c.is_control() || c.is_whitespace())
+    })
+}
+
+fn tool_output(value: Option<&Value>) -> Result<Value, String> {
+    if let Some(Value::Array(parts)) = value {
+        let mut mapped = Vec::new();
+        for part in parts {
+            mapped.push(match part["type"].as_str() {
+                Some("text") => json!({"type":"input_text","text":part["text"].as_str().ok_or("Responses tool text is invalid")?}),
+                Some("image") => response_content::image(part)?,
+                _ => return Err("Responses tool result media is unsupported".into()),
+            });
+        }
+        if mapped.iter().any(|p| p["type"] == "input_image") {
+            return Ok(Value::Array(mapped));
+        }
+    }
+    Ok(Value::String(as_text(value)))
 }
 
 #[cfg(test)]
@@ -941,5 +1075,185 @@ mod tests {
                 "output": "{\"ok\": true, \"items\": [1, 2]}",
             })
         );
+    }
+    #[test]
+    fn responses_image_and_reasoning_history_survive_an_entire_mock_turn() {
+        let signer = crate::openai_chat::ReasoningSigner::new("synthetic", "profile").unwrap();
+        let response = json!({"id":"response-1","status":"completed","output":[
+            {"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"fixture summary"}],"encrypted_content":"opaque-fixture"},
+            {"type":"message","id":"m1","content":[{"type":"output_text","text":"fixture answer"}]}
+        ]});
+        let mapped = super::openai_to_anthropic_with_reasoning(
+            &response,
+            "alias",
+            "fixture-model",
+            &serde_json::Map::new(),
+            &signer,
+        )
+        .unwrap();
+        let history = json!({"messages":[
+            {"role":"user","content":[{"type":"text","text":"look"},{"type":"image","source":{"type":"url","url":"https://example.invalid/image.png"}},{"type":"text","text":"then explain"}]},
+            {"role":"assistant","content":mapped["content"]},
+            {"role":"user","content":"continue"}
+        ]});
+        let (request, _) = super::anthropic_to_openai_with_reasoning(
+            &history,
+            "fixture-model",
+            false,
+            Some(&signer),
+        )
+        .unwrap();
+        assert_eq!(request["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(request["input"][0]["content"][2]["text"], "then explain");
+        assert_eq!(request["input"][1], response["output"][0]);
+        assert_eq!(request["input"][2]["content"], "fixture answer");
+    }
+
+    #[test]
+    fn validated_responses_reject_missing_duplicate_or_invalid_tool_arguments() {
+        let known = serde_json::Map::from_iter([(
+            "echo".to_string(),
+            json!({"type":"object","required":["x"],"properties":{"x":{"type":"string"}},"additionalProperties":false}),
+        )]);
+        for arguments in ["not-json", "{\"x\":2}", "{\"x\":\"ok\",\"extra\":true}"] {
+            assert!(super::openai_to_anthropic_validated(&json!({"output":[{"type":"function_call","call_id":"c1","name":"echo","arguments":arguments}]}),"alias",&known).is_err());
+        }
+        let item = json!({"type":"function_call","call_id":"same","name":"echo","arguments":"{\"x\":\"ok\"}"});
+        assert!(super::openai_to_anthropic_validated(
+            &json!({"output":[item.clone(),item]}),
+            "alias",
+            &known
+        )
+        .is_err());
+        assert!(super::openai_to_anthropic_validated(
+            &json!({"output":[{"type":"function_call","name":"echo","arguments":"{}"}]}),
+            "alias",
+            &known
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn unknown_history_media_is_an_error_instead_of_an_empty_prompt() {
+        for block in [
+            json!({"type":"document"}),
+            json!({"type":"audio"}),
+            json!({"type":"unknown"}),
+        ] {
+            assert!(anthropic_to_openai(
+                &json!({"messages":[{"role":"user","content":[block]}]}),
+                "fixture",
+                false
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn responses_forced_tool_choice_is_preserved_and_unknown_tools_rejected() {
+        let request = json!({"messages":[{"role":"user","content":"fixture"}],"tools":[{"name":"echo","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"echo"}});
+        let (mapped, _) = anthropic_to_openai(&request, "fixture", false).unwrap();
+        assert_eq!(
+            mapped["tool_choice"],
+            json!({"type":"function","name":"echo"})
+        );
+        let mut required = request.clone();
+        required["tool_choice"] = json!({"type":"any"});
+        assert_eq!(
+            anthropic_to_openai(&required, "fixture", false).unwrap().0["tool_choice"],
+            "required"
+        );
+        let mut invalid = request;
+        invalid["tool_choice"]["name"] = json!("foreign");
+        assert!(anthropic_to_openai(&invalid, "fixture", false).is_err());
+        invalid["system"] = json!([{"type":"image","text":"must not silently disappear"}]);
+        assert!(anthropic_to_openai(&invalid, "fixture", false).is_err());
+    }
+
+    fn repeated_branch_refs(keyword: &str, depth: usize) -> Value {
+        let mut definitions = serde_json::Map::new();
+        definitions.insert("leaf".into(), json!({"type":"object"}));
+        for level in 0..depth {
+            let target = if level == 0 {
+                "leaf".to_string()
+            } else {
+                format!("n{}", level - 1)
+            };
+            let reference = json!({"$ref":format!("#/$defs/{target}")});
+            // Exactly one oneOf branch matches, but both branches must walk
+            // the shared reference. This must consume one global work budget.
+            let branches = if keyword == "oneOf" {
+                json!([reference.clone(), {"allOf":[reference, false]}])
+            } else {
+                json!([reference.clone(), reference])
+            };
+            let mut node = serde_json::Map::new();
+            node.insert(keyword.to_string(), branches);
+            definitions.insert(format!("n{level}"), Value::Object(node));
+        }
+        json!({"type":"object","$defs":definitions,"$ref":format!("#/$defs/n{}",depth - 1)})
+    }
+
+    #[test]
+    fn tool_schema_repeated_branch_references_have_a_global_work_bound() {
+        for keyword in ["anyOf", "allOf", "oneOf"] {
+            let schema = repeated_branch_refs(keyword, 14);
+            let started = std::time::Instant::now();
+            assert!(
+                !super::tool_arguments_match_schema(&json!({}), &schema),
+                "{keyword} reused branch budgets"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // Independent siblings may revisit the same local reference.
+            assert!(super::tool_arguments_match_schema(
+                &json!({}),
+                &repeated_branch_refs(keyword, 4)
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_schema_node_exhaustion_cannot_be_negated_or_select_else() {
+        let repeated = repeated_branch_refs("anyOf", 14);
+        let definitions = repeated["$defs"].clone();
+        let condition = json!({"allOf":[{"$ref":"#/$defs/n13"},false]});
+        for schema in [
+            json!({"$defs":definitions,"not":condition}),
+            json!({"$defs":definitions,"if":condition,"then":false,"else":true}),
+        ] {
+            assert!(
+                !super::tool_arguments_match_schema(&json!({}), &schema),
+                "work exhaustion was inverted into success"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_schema_depth_exhaustion_cannot_be_negated_or_select_else() {
+        let mut deep = json!(true);
+        for _ in 0..super::MAX_SCHEMA_DEPTH + 1 {
+            deep = json!({"allOf":[deep]});
+        }
+        for schema in [
+            json!({"not":deep}),
+            json!({"if":deep,"then":false,"else":true}),
+        ] {
+            assert!(
+                !super::tool_arguments_match_schema(&json!({}), &schema),
+                "depth exhaustion was inverted into success"
+            );
+        }
+        assert!(super::tool_arguments_match_schema(
+            &json!({}),
+            &json!({"not":{"type":"string"}})
+        ));
+        assert!(super::tool_arguments_match_schema(
+            &json!({}),
+            &json!({"if":{"type":"object"},"then":true,"else":false})
+        ));
+        assert!(!super::tool_arguments_match_schema(
+            &json!({}),
+            &json!({"$ref":"#"})
+        ));
     }
 }

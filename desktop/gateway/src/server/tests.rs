@@ -11,10 +11,10 @@ use serde_json::{json, Map, Value};
 use super::http_codec::{write_codex_models_response, RequestHead};
 use super::inference_dispatch::{
     apply_dsml_nonstream, collect_codex_nonstream, dsml_stream_filter, forward_stream_body,
-    handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
-    map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
-    write_codex_models_with_refresh, CodexComponents, CodexNonstreamError, CodexPumpError,
-    RequestNonceGenerator, StreamFilter, StreamTermination,
+    handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_openai_stream,
+    handle_post, map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
+    stream_error_event, write_codex_models_with_refresh, CodexComponents, CodexNonstreamError,
+    CodexPumpError, RequestNonceGenerator, StreamFilter, StreamTermination,
 };
 #[cfg(unix)]
 use super::skill_bridge_host::{
@@ -1247,7 +1247,7 @@ fn bridge_temp_dir(label: &str) -> std::path::PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::path::PathBuf::from("/private/tmp").join(format!(
+    let root = std::env::temp_dir().join(format!(
         "csswitch-bridge-{label}-{}-{suffix}",
         std::process::id()
     ));
@@ -1354,17 +1354,9 @@ fn bridge_reader_rejects_symlink_and_fifo_without_blocking() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
 
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::path::PathBuf::from("/private/tmp").join(format!(
-        "csswitch-bridge-reader-{}-{suffix}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let root = bridge_temp_dir("reader");
     let regular = root.join("regular");
     std::fs::write(&regular, b"{}").unwrap();
     std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1815,4 +1807,95 @@ fn downstream_write_error_stops_before_more_reads_or_finalize() {
         filter.finalize().is_err(),
         "buffer must remain unflushed after client write failure"
     );
+}
+
+fn openai_keepalives_obey_total_deadline(terminal_before_comments: bool) {
+    let upstream = bind_loopback();
+    let address = upstream.local_addr().unwrap();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().unwrap();
+        read_mock_http_request(&mut stream);
+        stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n").unwrap();
+        let initial = format!(
+            "data: {}\n\n",
+            json!({"id":"fixture","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":if terminal_before_comments {json!("stop")} else {Value::Null}}]})
+        );
+        let initial = if terminal_before_comments {
+            initial + "data: [DONE]\n\n"
+        } else {
+            initial
+        };
+        if write!(stream, "{:x}\r\n{}\r\n", initial.len(), initial).is_err() {
+            return;
+        }
+        for _ in 0..60 {
+            if stream.write_all(b"d\r\n: keepalive\n\n\r\n").is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = stream.write_all(b"0\r\n\r\n");
+    });
+    let mut contract = crate::provider_contracts::load_runtime_contract(
+        "openai-custom",
+        Some("custom-openai-chat"),
+        Some(&csswitch_provider_contracts::static_catalog_digest()),
+    )
+    .unwrap();
+    contract.request_timeout = Duration::from_millis(150);
+    contract.read_idle_timeout = Duration::from_secs(1);
+    contract.connect_timeout = Duration::from_secs(1);
+    let config = GatewayConfig {
+        provider: "openai-custom".into(),
+        port: 0,
+        auth_secret: Some("fixture-secret".into()),
+        api_key: Some("fixture-key".into()),
+        upstream_url: format!("http://{address}/chat/completions"),
+        models_url: None,
+        relay_thinking: None,
+        provider_contract: Some(contract),
+        intent: crate::config::GatewayIntent::Formal,
+        static_model_resolver: None,
+        shim_mode: "off".into(),
+        codex_state_root: None,
+        codex_contract: None,
+        launch_id: "fixture".into(),
+        skill_data_dir: None,
+        skill_bridge_dir: None,
+        skill_bridge_token: None,
+        skill_authority_fence: None,
+        science_host_context: None,
+    };
+    let signer = crate::openai_chat::ReasoningSigner::new("fixture", "profile").unwrap();
+    let started = Instant::now();
+    let response = capture_tcp_response(|downstream| {
+        handle_openai_stream(
+            downstream,
+            &config,
+            json!({"stream":true}),
+            "alias",
+            "model",
+            &signer,
+            &Map::new(),
+        )
+    });
+    let elapsed = started.elapsed();
+    worker.join().unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "keepalives extended the request: {elapsed:?}"
+    );
+    assert_eq!(response.matches("event: error").count(), 1);
+    assert!(!response.contains("event: message_stop"));
+}
+
+#[test]
+fn openai_stream_keepalives_cannot_extend_total_deadline() {
+    openai_keepalives_obey_total_deadline(false);
+}
+
+#[test]
+fn openai_terminal_keepalives_cannot_extend_total_deadline() {
+    openai_keepalives_obey_total_deadline(true);
 }
