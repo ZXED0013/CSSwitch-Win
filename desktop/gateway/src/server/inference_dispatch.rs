@@ -1122,6 +1122,219 @@ pub(super) fn handle_codex_messages_with_catalog(
     );
 }
 
+pub(super) fn handle_openai_stream(
+    downstream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    body: Value,
+    model: &str,
+    target: &str,
+    signer: &openai_chat::ReasoningSigner,
+    known: &Map<String, Value>,
+) {
+    let started = std::time::Instant::now();
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        api_error_json(downstream, 502, "OpenAI streaming runtime unavailable");
+        return;
+    };
+    let connect = cfg
+        .provider_contract
+        .as_ref()
+        .map(|c| c.connect_timeout)
+        .unwrap_or(Duration::from_secs(10));
+    let headers_timeout = cfg
+        .provider_contract
+        .as_ref()
+        .map(|c| c.request_timeout)
+        .unwrap_or(Duration::from_secs(300));
+    let idle = cfg
+        .provider_contract
+        .as_ref()
+        .map(|c| c.read_idle_timeout)
+        .unwrap_or(Duration::from_secs(300));
+    let Ok(watcher) = downstream.try_clone() else {
+        return;
+    };
+    let cancel = || async {
+        loop {
+            if downstream_closed(&watcher) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let opened = runtime.block_on(async {
+        // This timeout covers the entire response body, including keepalives
+        // and the clean EOF required after a semantic terminal event.
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect)
+            .timeout(headers_timeout.saturating_sub(started.elapsed()))
+            .redirect(reqwest::redirect::Policy::none())
+            .build().map_err(|_| 502_u16)?;
+        let body = serde_json::to_vec(&body).map_err(|_| 502_u16)?;
+        let request = client.post(&cfg.upstream_url).header("content-type", "application/json").header("accept", "text/event-stream")
+            .header("user-agent", crate::config::UPSTREAM_UA).bearer_auth(cfg.api_key.as_deref().unwrap_or("")).body(body);
+        // Dropping either send/chunk future closes the request; no inference POST retry.
+        tokio::select! {
+            _ = cancel() => Err(499),
+            result = tokio::time::timeout(headers_timeout, request.send()) => match result {
+                Ok(Ok(response)) if response.status().is_success() => Ok(response),
+                Ok(Ok(response)) => Err(if matches!(response.status().as_u16(), 401|403|429) {response.status().as_u16()} else {502}),
+                _ => Err(502),
+            }
+        }
+    });
+    let mut response = match opened {
+        Ok(response) => response,
+        Err(499) => return,
+        Err(status) => {
+            api_error_json(
+                downstream,
+                status,
+                "OpenAI upstream stream could not be opened",
+            );
+            return;
+        }
+    };
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(';').next())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if content_type == "application/json"
+        || (content_type.starts_with("application/") && content_type.ends_with("+json"))
+    {
+        // Some compatible endpoints ignore stream=true. Consume this same
+        // response once, with bounds and cancellation, then replay only after
+        // full validation. Never issue a second inference request.
+        const JSON_LIMIT: usize = 16 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|size| size > JSON_LIMIT as u64)
+        {
+            api_error_json(
+                downstream,
+                502,
+                "OpenAI JSON fallback exceeds the response limit",
+            );
+            return;
+        }
+        let remaining = headers_timeout.saturating_sub(started.elapsed());
+        let read = runtime.block_on(async {
+            tokio::time::timeout(remaining, async {
+                let mut bytes = Vec::new();
+                loop {
+                    let chunk = tokio::select! {
+                        _ = cancel() => return Err("cancelled"),
+                        result = tokio::time::timeout(idle, response.chunk()) => match result {
+                            Ok(Ok(chunk)) => chunk,
+                            _ => return Err("read"),
+                        },
+                    };
+                    let Some(chunk) = chunk else {
+                        return Ok(bytes);
+                    };
+                    if bytes.len().saturating_add(chunk.len()) > JSON_LIMIT {
+                        return Err("limit");
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+            })
+            .await
+        });
+        let bytes = match read {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err("cancelled")) => return,
+            _ => {
+                api_error_json(downstream, 502, "OpenAI JSON fallback failed or timed out");
+                return;
+            }
+        };
+        let mapped: Result<Value, String> = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| "OpenAI JSON fallback is invalid".to_string())
+            .and_then(|value| {
+                if cfg.provider == "openai-responses" {
+                    openai_responses::openai_to_anthropic_with_reasoning(
+                        &value, model, target, known, signer,
+                    )
+                } else {
+                    openai_chat::openai_to_anthropic_validated(&value, model, target, signer, known)
+                }
+            });
+        let mapped = match mapped {
+            Ok(mapped) => mapped,
+            Err(_) => {
+                api_error_json(downstream, 502, "OpenAI JSON fallback failed validation");
+                return;
+            }
+        };
+        if write!(downstream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").and_then(|_| downstream.flush()).is_err() { return; }
+        for (kind, data) in openai_chat::replay_as_sse_events(&mapped) {
+            if write_chunk(downstream, &sse_event(&kind, &data)).is_err() {
+                return;
+            }
+        }
+        let _ = downstream.write_all(b"0\r\n\r\n");
+        let _ = downstream.flush();
+        return;
+    }
+    if content_type != "text/event-stream" {
+        api_error_json(
+            downstream,
+            502,
+            "OpenAI upstream did not return SSE or JSON",
+        );
+        return;
+    }
+    if write!(downstream, "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n").and_then(|_| downstream.flush()).is_err() { return; }
+    let mut decoder = crate::openai_stream::Decoder::default();
+    let mut chat = crate::openai_stream::Chat::new(model, target, signer, known);
+    let mut responses = crate::openai_stream::Responses::new(model, target, signer, known);
+    let result: Result<(), &'static str> = runtime.block_on(async {
+        let mut terminal = None;
+        let mut responses_done_marker = false;
+        loop {
+            let chunk = tokio::select! {
+                _ = cancel() => return Err("cancelled"),
+                result = tokio::time::timeout(idle, response.chunk()) => match result { Ok(Ok(chunk)) => chunk, _ => return Err("protocol") },
+            };
+            let Some(chunk) = chunk else {
+                decoder.finish().map_err(|_| "protocol")?;
+                if !if cfg.provider == "openai-responses" { responses.complete() } else { chat.complete() } { return Err("protocol"); }
+                let data = terminal.take().ok_or("protocol")?;
+                write_chunk(downstream, &sse_event("message_stop", &data)).map_err(|_| "cancelled")?;
+                return Ok(());
+            };
+            for frame in decoder.feed(&chunk).map_err(|_| "protocol")? {
+                if cfg.provider == "openai-responses" && responses.complete() && matches!(&frame, crate::openai_stream::Frame::Done) && !responses_done_marker {
+                    responses_done_marker = true; continue;
+                }
+                let events = if cfg.provider == "openai-responses" { responses.apply(frame) } else { chat.apply(frame) }.map_err(|_| "protocol")?;
+                for (kind, data) in events {
+                    if kind == "message_stop" { terminal = Some(data); }
+                    else { write_chunk(downstream, &sse_event(&kind, &data)).map_err(|_| "cancelled")?; }
+                }
+            }
+        }
+    });
+    if result == Err("cancelled") {
+        return;
+    }
+    if result.is_err() {
+        let _ = write_chunk(
+            downstream,
+            &stream_error_event("OpenAI upstream stream failed validation or timed out"),
+        );
+    }
+    let _ = downstream.write_all(b"0\r\n\r\n");
+    let _ = downstream.flush();
+}
+
 fn handle_messages(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
@@ -1199,10 +1412,11 @@ fn handle_messages(
             .unwrap_or("claude-sonnet-5")
             .to_string();
         let transformed = if cfg.provider == "openai-responses" {
-            openai_responses::anthropic_to_openai(
+            openai_responses::anthropic_to_openai_with_reasoning(
                 &raw,
                 &target_model,
                 openai_responses::is_dashscope_responses_endpoint(&cfg.provider, &cfg.upstream_url),
+                Some(&reasoning_signer),
             )
             .map(|(body, metadata)| (body, Some(metadata)))
         } else if cfg.provider == "openai-custom" {
@@ -1212,13 +1426,32 @@ fn handle_messages(
             openai_chat::anthropic_to_openai(&raw, &target_model, &reasoning_signer)
                 .map(|body| (body, None))
         };
-        let (transformed, responses_metadata) = match transformed {
+        let (mut transformed, responses_metadata) = match transformed {
             Ok(result) => result,
             Err(e) => {
                 invalid_request_json(stream, &e);
                 return;
             }
         };
+        if let Some(metadata) = responses_metadata.as_ref() {
+            log_responses_metadata(&transformed, metadata, is_stream);
+        }
+        if is_stream {
+            transformed["stream"] = Value::Bool(true);
+            if cfg.provider != "openai-responses" {
+                transformed["stream_options"] = json!({"include_usage":true});
+            }
+            handle_openai_stream(
+                stream,
+                cfg,
+                transformed,
+                &model_id,
+                &target_model,
+                &reasoning_signer,
+                &known_tools,
+            );
+            return;
+        }
         let body = match serde_json::to_vec(&transformed) {
             Ok(body) => body,
             Err(e) => {
@@ -1226,9 +1459,6 @@ fn handle_messages(
                 return;
             }
         };
-        if let Some(metadata) = responses_metadata.as_ref() {
-            log_responses_metadata(&transformed, metadata, is_stream);
-        }
         match messages::post_nonstream(cfg, body) {
             Ok(resp) => {
                 let openai_resp: Value = match serde_json::from_slice(&resp.body) {
@@ -1239,17 +1469,20 @@ fn handle_messages(
                     }
                 };
                 let anthropic_resp = if cfg.provider == "openai-responses" {
-                    openai_responses::openai_to_anthropic_validated(
+                    openai_responses::openai_to_anthropic_with_reasoning(
                         &openai_resp,
                         &model_id,
+                        &target_model,
                         &known_tools,
+                        &reasoning_signer,
                     )
                 } else {
-                    openai_chat::openai_to_anthropic(
+                    openai_chat::openai_to_anthropic_validated(
                         &openai_resp,
                         &model_id,
                         &target_model,
                         &reasoning_signer,
+                        &known_tools,
                     )
                 };
                 let anthropic_resp = match anthropic_resp {
@@ -1263,21 +1496,7 @@ fn handle_messages(
                         return;
                     }
                 };
-                if is_stream {
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-                    );
-                    for (event, data) in openai_chat::replay_as_sse_events(&anthropic_resp) {
-                        if write_chunk(stream, &sse_event(&event, &data)).is_err() {
-                            return;
-                        }
-                    }
-                    let _ = stream.write_all(b"0\r\n\r\n");
-                    let _ = stream.flush();
-                } else {
-                    write_json(stream, 200, "OK", anthropic_resp);
-                }
+                write_json(stream, 200, "OK", anthropic_resp);
             }
             Err(e) => api_error_json(stream, e.status, &e.detail),
         }

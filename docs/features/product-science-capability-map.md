@@ -162,6 +162,9 @@ CSSwitch 第三方模式真正必须托管的只有：
 CSSwitch 都负有 `MODEL-GATEWAY` 协议兼容责任：支持 provider 明确具备的能力，
 对不具备或尚未验证的能力给出可定位降级，不得静默改写为另一种语义。
 
+OpenAI Chat / Responses 的图片输入、reasoning 回放、工具验证与成功停止条件，
+统一见[Gateway 内容与串流边界](../architecture/gateway-provider-routing.md#openai-chat-responses-内容与串流)。
+
 外部 Skill、系统 SSH 和 Codex 属于窄桥接：CSSwitch 只负责自己明确建立的入口，
 不接管 Science Agent、OpenSSH/server 或 Codex/第三方服务的后续语义。
 

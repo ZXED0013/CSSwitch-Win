@@ -25,6 +25,8 @@ Desktop build 会构建并打包同变体 Rust Gateway sidecar。当前生产运
 | HTTP head/body codec、limits 与错误响应 | `desktop/gateway/src/server/http_codec.rs` |
 | CONNECT target policy、DNS/dial 与双向 tunnel budget | `desktop/gateway/src/connect.rs` |
 | GET/POST、provider/Codex inference 与 SSE | `desktop/gateway/src/server/inference_dispatch.rs` |
+| OpenAI Chat / Responses 增量帧、内容顺序与完成验证 | `desktop/gateway/src/openai_stream.rs` |
+| Responses 图片与本地签署 reasoning envelope | `desktop/gateway/src/response_content.rs` |
 | Skill install bridge host lifecycle | `desktop/gateway/src/server/skill_bridge_host.rs` |
 | `server::tests::*` 测试身份 | `desktop/gateway/src/server/tests.rs` |
 | Desktop 侧 launch plan、recovery、reuse/spawn/stop | `desktop/src-tauri/src/runtime/proxy_lifecycle.rs` façade |
@@ -95,6 +97,30 @@ Kimi 的 Anthropic-compatible 路由采用以下窄兼容：
 API key 会作为入站 Tauri command/IPC 参数进入进程，并进入正式 Gateway 的
 credential env / launch context；它不进 argv 或普通日志，出站配置 DTO 只返回
 掩码而不回传完整 key。
+
+### OpenAI Chat / Responses 内容与串流
+
+`inference_dispatch` 接受已冻结的配置和入站 Messages，发出一次上游 POST，
+并拥有连接、读取期限、取消和下游写入。`openai_stream` 只接受字节帧及模型／工具
+上下文，维护有界的请求内状态，输出待写入的 Anthropic 事件；它不读写持久状态、
+不执行工具，也不重送推理。帧上限为 1 MiB，累计串流及 JSON fallback 上限为
+16 MiB。既有非串流成功响应和请求的 64 MiB 合同不变。
+连接和读取 idle 期限仍来自 provider contract；总 request deadline 覆盖请求头到
+响应结束，包括等待 terminal 后的干净 EOF，keepalive 不得延长这项总期限。
+
+普通文字 delta 可立即输出；工具参数必须完成 JSON、工具名称与声明 schema 验证，
+reasoning 必须完成本地签署后才输出。若先前有尚未输出的工具或 reasoning，后续
+文字也等待完成，以保持原始内容区块顺序。只有合法 terminal 和干净 EOF 同时满足
+才发送成功 `message_stop`；截断、尾随错误、超限或逾时只投影错误，不补成功停止。
+取消关闭同一上游请求。上游忽略 `stream=true` 回传 JSON 时，仅限量读取并验证该次
+响应后重播 SSE，不另发 POST。
+
+`response_content` 由 Chat / Responses 请求映射、Responses 结果映射及串流验证调用。
+它接受图片与 reasoning block，返回对应 OpenAI 内容或稳定错误；没有文件、进程或
+网络副作用。图片输入保留原始顺序。Responses reasoning 的完整 item（含 opaque
+state）放入本地 HMAC envelope，回放时核对配置上下文、模型与内容；这不是 provider
+原生签名或账号权限。无法表示的 audio、document、输出媒体或 refusal 明确拒绝，
+不静默丢弃，也不宣称完整多模态相容。真实 provider 与 Science 的完整会话仍需独立验收。
 
 ## scratch Gateway
 

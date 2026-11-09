@@ -1,4 +1,5 @@
 import http.client
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -1165,7 +1166,7 @@ class RustGatewayLoopback(unittest.TestCase):
                                         "id": "call_2",
                                         "type": "function",
                                         "function": {
-                                            "name": "grade",
+                                            "name": "lookup",
                                             "arguments": "{\"score\":1}",
                                         },
                                     }
@@ -1247,6 +1248,7 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             self.assertEqual(body["content"][0], {"type": "text", "text": "answer"})
             self.assertEqual(body["content"][1]["type"], "tool_use")
+            self.assertEqual(body["content"][1]["name"], "lookup")
             self.assertEqual(body["content"][1]["input"], {"score": 1})
             self.assertEqual(body["stop_reason"], "tool_use")
             self.assertEqual(body["usage"], {"input_tokens": 7, "output_tokens": 8})
@@ -1322,7 +1324,8 @@ class RustGatewayLoopback(unittest.TestCase):
             self.assertIn(b'"text":"streamed"', body)
             self.assertIn(b"event: message_stop", body)
             mapped = json.loads(upstream.requests[0]["body"])
-            self.assertFalse(mapped["stream"], "qwen Rust path should fetch full body then replay SSE")
+            self.assertTrue(mapped["stream"], "request SSE; replay the same JSON response if an upstream ignores stream=true")
+            self.assertEqual(len(upstream.requests), 1, "JSON fallback must never repeat the inference POST")
         finally:
             self.stop_gateway(proc)
             upstream.shutdown()
@@ -2184,7 +2187,7 @@ class RustGatewayLoopback(unittest.TestCase):
                             }
                         ],
                     )
-                    self.assertEqual(mapped["tool_choice"], "auto")
+                    self.assertEqual(mapped["tool_choice"], "required")
                 finally:
                     self.stop_gateway(proc)
         finally:
@@ -4196,6 +4199,127 @@ class RustGatewayLoopback(unittest.TestCase):
                 self.assertEqual(sock.recv(4), b"ping")
         finally:
             self.stop_gateway(proc)
+
+    @staticmethod
+    def _openai_frame(value):
+        return b"data: " + json.dumps(value).encode() + b"\n\n"
+
+    @staticmethod
+    def _openai_events(body):
+        return [json.loads(line[6:]) for line in body.splitlines() if line.startswith(b"data: ")]
+
+    def _openai_text_stream(self, provider, text="fixture answer"):
+        frame = self._openai_frame
+        if provider == "openai-custom":
+            return frame({"id":"chat-fixture","choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}]}) + b"data: [DONE]\n\n"
+        return b"".join([
+            frame({"type":"response.created","response":{"id":"resp-fixture"}}),
+            frame({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1","content":[]}}),
+            frame({"type":"response.output_text.delta","output_index":0,"item_id":"m1","content_index":0,"delta":text}),
+            frame({"type":"response.completed","response":{"id":"resp-fixture","status":"completed","output":[{"type":"message","id":"m1","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":1,"output_tokens":2}}}),
+        ])
+
+    @contextmanager
+    def _openai_mock_exchange(self, provider, payload, content_type="text/event-stream"):
+        upstream = MockUpstream(payload, content_type=content_type)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix="csswitch-openai-adapter-") as isolated_home:
+                proc, port = self.start_current_gateway(
+                    provider=provider, openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+                    openai_model="fixture-model", env_overrides={"HOME":isolated_home},
+                )
+                try:
+                    def exchange(**overrides):
+                        request = {"model":"claude-opus-4-8","max_tokens":40,"stream":True,"messages":[{"role":"user","content":"fixture only"}]}
+                        request.update(overrides)
+                        conn = http.client.HTTPConnection("127.0.0.1",port,timeout=5)
+                        try:
+                            conn.request("POST","/secret/v1/messages",json.dumps(request).encode(),{"content-type":"application/json"})
+                            response = conn.getresponse()
+                            return response.status,response.read()
+                        finally:
+                            conn.close()
+                    yield exchange,upstream
+                finally:
+                    self.stop_gateway(proc)
+        finally:
+            upstream.shutdown()
+            thread.join(timeout=2)
+            upstream.server_close()
+
+    def test_openai_stream_terminals_require_clean_eof(self):
+        for provider in ("openai-custom","openai-responses"):
+            for suffix in (b"",self._openai_frame({"type":"error","error":{"message":"synthetic trailing error"}}),b'data: {"type":'):
+                with self.subTest(provider=provider,suffix=suffix):
+                    with self._openai_mock_exchange(provider,self._openai_text_stream(provider)+suffix) as (exchange,upstream):
+                        status,body = exchange()
+                        self.assertEqual(status,200)
+                        self.assertEqual(body.count(b"event: message_stop"),0 if suffix else 1)
+                        self.assertEqual(body.count(b"event: error"),1 if suffix else 0)
+                        self.assertEqual(len(upstream.requests),1)
+                        self.assertTrue(json.loads(upstream.requests[0]["body"])["stream"])
+
+    def test_openai_nonstream_and_json_fallback_validate_tool_schemas(self):
+        schema = {"name":"echo","input_schema":{"type":"object","required":["x"],"properties":{"x":{"type":"string"}},"additionalProperties":False}}
+        invalid = json.dumps({"id":"bad-tool","choices":[{"message":{"role":"assistant","content":None,"tool_calls":[{"id":"call1","type":"function","function":{"name":"echo","arguments":'{"x":7}'}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":2}}).encode()
+        for stream in (False,True):
+            with self.subTest(stream=stream):
+                with self._openai_mock_exchange("openai-custom",invalid,"application/json") as (exchange,upstream):
+                    status,body = exchange(stream=stream,tools=[schema])
+                    self.assertEqual(status,502)
+                    assert_error_shape(self,body,"api_error")
+                    self.assertNotIn(b"event: message_stop",body)
+                    self.assertEqual(len(upstream.requests),1)
+
+    def test_responses_reasoning_image_order_and_tool_blocks_round_trip(self):
+        frame = self._openai_frame
+        reasoning = {"id":"r1","type":"reasoning","summary":[{"type":"summary_text","text":"fixture summary"}],"encrypted_content":"opaque-fixture"}
+        before = {"id":"m1","type":"message","content":[{"type":"output_text","text":"before tool"}]}
+        tool = {"id":"f1","type":"function_call","call_id":"call1","name":"echo","arguments":'{"x":"fixture"}'}
+        after = {"id":"m2","type":"message","content":[{"type":"output_text","text":"after tool"}]}
+        frames = [frame({"type":"response.created","response":{"id":"resp-order"}})]
+        for index,item in enumerate((reasoning,before,tool,after)):
+            initial = dict(item)
+            if item["type"] == "message":
+                initial["content"] = []
+                delta = {"type":"response.output_text.delta","content_index":0,"delta":item["content"][0]["text"]}
+            elif item["type"] == "reasoning":
+                initial["summary"] = []
+                delta = {"type":"response.reasoning_summary_text.delta","summary_index":0,"delta":"fixture summary"}
+            else:
+                initial["arguments"] = ""
+                delta = {"type":"response.function_call_arguments.delta","delta":item["arguments"]}
+            frames.append(frame({"type":"response.output_item.added","output_index":index,"item":initial}))
+            frames.append(frame(dict(delta,output_index=index,item_id=item["id"])))
+        frames.append(frame({"type":"response.completed","response":{"id":"resp-order","status":"completed","output":[reasoning,before,tool,after],"usage":{}}}))
+        initial_message = {"role":"user","content":[{"type":"text","text":"before image"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}},{"type":"text","text":"after image"}]}
+        tools = [{"name":"echo","input_schema":{"type":"object","required":["x"],"properties":{"x":{"type":"string"}}}}]
+        with self._openai_mock_exchange("openai-responses",b"".join(frames)) as (exchange,upstream):
+            status,body = exchange(messages=[initial_message],tools=tools)
+            self.assertEqual(status,200)
+            events = self._openai_events(body)
+            self.assertEqual([event["content_block"]["type"] for event in events if event["type"] == "content_block_start"],["thinking","text","tool_use","text"])
+            signature = next(event["delta"]["signature"] for event in events if event.get("delta",{}).get("type") == "signature_delta")
+            mapped = json.loads(upstream.requests[0]["body"])
+            self.assertEqual([part["type"] for part in mapped["input"][0]["content"]],["input_text","input_image","input_text"])
+            self.assertEqual(mapped["input"][0]["content"][1]["image_url"],"data:image/png;base64,aW1hZ2U=")
+            upstream.response_body = self._openai_text_stream("openai-responses","follow-up")
+            status,body = exchange(messages=[initial_message,{"role":"assistant","content":[{"type":"thinking","thinking":"fixture summary","signature":signature}]},{"role":"user","content":"continue"}])
+            self.assertEqual(status,200)
+            self.assertEqual(body.count(b"event: message_stop"),1)
+            self.assertEqual(json.loads(upstream.requests[1]["body"])["input"][1],reasoning)
+
+    def test_openai_json_fallback_preserves_opaque_reasoning(self):
+        response = json.dumps({"id":"json-reasoning","status":"completed","output":[{"type":"reasoning","id":"r1","summary":[],"encrypted_content":"opaque-fixture"}],"usage":{}}).encode()
+        with self._openai_mock_exchange("openai-responses",response,"application/json") as (exchange,upstream):
+            status,body = exchange()
+            self.assertEqual(status,200)
+            self.assertIn(b'"type":"redacted_thinking"',body)
+            self.assertIn(b"csswitch.openai-responses-thinking.v1.",body)
+            self.assertEqual(body.count(b"event: message_stop"),1)
+            self.assertEqual(len(upstream.requests),1)
 
 
 if __name__ == "__main__":

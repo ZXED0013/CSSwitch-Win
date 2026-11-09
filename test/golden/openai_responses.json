@@ -248,7 +248,10 @@
     "model": "gpt-5.2",
     "stream": false,
     "temperature": 0.2,
-    "tool_choice": "auto",
+    "tool_choice": {
+      "type": "function",
+      "name": "lookup"
+    },
     "tools": [
       {
         "description": "search",

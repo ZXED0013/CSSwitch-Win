@@ -38,6 +38,54 @@ pub struct ReasoningSigner {
 }
 
 impl ReasoningSigner {
+    // Purpose-separated envelopes let the Responses adapter retain opaque
+    // reasoning items without trusting history supplied by a downstream client.
+    pub(crate) fn seal_payload(&self, purpose: &str, payload: &Value) -> Result<String, String> {
+        let encoded = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(payload).map_err(|_| "reasoning envelope is invalid")?);
+        let mut mac =
+            HmacSha256::new_from_slice(&self.key).map_err(|_| "reasoning key unavailable")?;
+        mac.update(purpose.as_bytes());
+        mac.update(b".");
+        mac.update(encoded.as_bytes());
+        let signature = format!(
+            "{purpose}.{encoded}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        );
+        if signature.len() > MAX_REASONING_BYTES {
+            return Err("reasoning envelope exceeds the limit".into());
+        }
+        Ok(signature)
+    }
+
+    pub(crate) fn verify_payload(&self, purpose: &str, signature: &str) -> Result<Value, String> {
+        if signature.len() > MAX_REASONING_BYTES {
+            return Err("reasoning envelope exceeds the limit".into());
+        }
+        let rest = signature
+            .strip_prefix(&format!("{purpose}."))
+            .ok_or("reasoning envelope purpose changed")?;
+        let (encoded, tag) = rest
+            .split_once('.')
+            .ok_or("reasoning envelope is invalid")?;
+        let tag = URL_SAFE_NO_PAD
+            .decode(tag)
+            .map_err(|_| "reasoning envelope is invalid")?;
+        let mut mac =
+            HmacSha256::new_from_slice(&self.key).map_err(|_| "reasoning key unavailable")?;
+        mac.update(purpose.as_bytes());
+        mac.update(b".");
+        mac.update(encoded.as_bytes());
+        mac.verify_slice(&tag)
+            .map_err(|_| "reasoning envelope authentication failed")?;
+        serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| "reasoning envelope is invalid")?,
+        )
+        .map_err(|_| "reasoning envelope is invalid".into())
+    }
+
     pub fn new(secret: &str, binding_context: &str) -> Result<Self, String> {
         if secret.is_empty() || binding_context.is_empty() {
             return Err("OpenAI Chat reasoning key is unavailable".into());
@@ -348,6 +396,7 @@ fn anthropic_to_openai_with_model(
             .ok_or("OpenAI Chat history content is invalid")?;
 
         let mut text_parts = Vec::new();
+        let mut user_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
         let mut tool_bindings = Vec::new();
@@ -358,12 +407,18 @@ fn anthropic_to_openai_with_model(
                 .ok_or("OpenAI Chat history content block is invalid")?;
             match block.get("type").and_then(Value::as_str) {
                 Some("text") => {
+                    user_parts.push(json!({"type":"text","text":block.get("text").and_then(Value::as_str).ok_or("OpenAI Chat history text block is invalid")?}));
                     text_parts.push(
                         block
                             .get("text")
                             .and_then(Value::as_str)
                             .ok_or("OpenAI Chat history text block is invalid")?,
                     );
+                }
+                Some("image") if role == "user" => {
+                    let image = crate::response_content::image(&Value::Object(block.clone()))?;
+                    user_parts
+                        .push(json!({"type":"image_url","image_url":{"url":image["image_url"]}}));
                 }
                 Some("thinking") => {
                     if role != "assistant" || reasoning.is_some() {
@@ -439,11 +494,19 @@ fn anthropic_to_openai_with_model(
             }
         }
         let joined_text = text_parts.join("");
+        let user_content = if user_parts.iter().any(|p| p["type"] == "image_url") {
+            Value::Array(user_parts)
+        } else {
+            Value::String(joined_text.clone())
+        };
         let resolved_any_tool_call = !tool_results.is_empty();
         if must_resolve_tool_calls && !resolved_any_tool_call {
             return Err("OpenAI Chat tool results must immediately follow tool calls".into());
         }
-        if must_resolve_tool_calls && !pending_tool_calls.is_empty() && !joined_text.is_empty() {
+        if must_resolve_tool_calls
+            && !pending_tool_calls.is_empty()
+            && (!joined_text.is_empty() || user_content.is_array())
+        {
             return Err("OpenAI Chat user text cannot precede pending tool results".into());
         }
         if role == "assistant" {
@@ -482,14 +545,14 @@ fn anthropic_to_openai_with_model(
                 return Err("OpenAI Chat user history contains assistant blocks".into());
             }
             msgs.extend(tool_results);
-            if !joined_text.is_empty() {
-                msgs.push(json!({"role": role, "content": joined_text}));
+            if !joined_text.is_empty() || user_content.is_array() {
+                msgs.push(json!({"role": role, "content": user_content}));
             }
         } else {
             if reasoning.is_some() || !tool_calls.is_empty() {
                 return Err("OpenAI Chat user history contains assistant blocks".into());
             }
-            msgs.push(json!({"role": role, "content": joined_text}));
+            msgs.push(json!({"role": role, "content": user_content}));
         }
     }
     if !pending_tool_calls.is_empty() {
@@ -631,6 +694,12 @@ pub fn openai_to_anthropic(
     }
     if msg.get("refusal").is_some_and(|refusal| !refusal.is_null()) {
         return Err("OpenAI Chat response was refused".into());
+    }
+    if ["audio", "function_call"]
+        .iter()
+        .any(|field| msg.get(*field).is_some_and(|v| !v.is_null()))
+    {
+        return Err("OpenAI Chat response media or legacy function call is unsupported".into());
     }
 
     let finish_reason = choice
@@ -776,6 +845,32 @@ pub fn openai_to_anthropic(
     }))
 }
 
+pub(crate) fn openai_to_anthropic_validated(
+    resp: &Value,
+    model: &str,
+    target: &str,
+    signer: &ReasoningSigner,
+    known: &Map<String, Value>,
+) -> Result<Value, String> {
+    let mapped = openai_to_anthropic(resp, model, target, signer)?;
+    for call in resp["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        crate::openai_responses::validate_stream_tool(
+            call["function"]["name"]
+                .as_str()
+                .ok_or("OpenAI tool name is invalid")?,
+            call["function"]["arguments"]
+                .as_str()
+                .ok_or("OpenAI tool arguments are invalid")?,
+            known,
+        )?;
+    }
+    Ok(mapped)
+}
+
 fn json_value_digest(value: &Value) -> Result<String, String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|_| "OpenAI Chat tool arguments are invalid".to_string())?;
@@ -811,6 +906,12 @@ pub fn replay_as_sse_events(aresp: &Value) -> Vec<(String, Value)> {
     for (idx, block) in blocks.iter().enumerate() {
         let index = Value::Number(serde_json::Number::from(idx));
         match block.get("type").and_then(Value::as_str) {
+            Some("redacted_thinking") => {
+                events.push((
+                    "content_block_start".to_string(),
+                    json!({"type":"content_block_start","index":idx,"content_block":block}),
+                ));
+            }
             Some("tool_use") => {
                 events.push((
                     "content_block_start".to_string(),
@@ -1323,6 +1424,45 @@ mod tests {
                 anthropic_to_openai_custom(&request, "kimi-k3", &signer).is_err(),
                 "{request}"
             );
+        }
+    }
+    #[test]
+    fn user_images_keep_their_position_relative_to_text() {
+        let request = json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"before"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}},
+            {"type":"text","text":"after"}
+        ]}]});
+        let mapped = anthropic_to_openai_custom(&request, "fixture-model", &signer()).unwrap();
+        assert_eq!(
+            mapped["messages"][0]["content"],
+            json!([
+                {"type":"text","text":"before"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,aW1hZ2U="}},
+                {"type":"text","text":"after"}
+            ])
+        );
+    }
+
+    #[test]
+    fn unsupported_response_media_cannot_be_silently_discarded() {
+        for extra in [
+            json!({"audio":{"id":"audio-fixture","data":"fixture"}}),
+            json!({"function_call":{"name":"echo","arguments":"{}"}}),
+        ] {
+            let mut message =
+                json!({"role":"assistant","content":"text beside unsupported output"});
+            message
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(openai_to_anthropic(
+                &json!({"id":"chat","choices":[{"message":message,"finish_reason":"stop"}]}),
+                "alias",
+                "fixture",
+                &signer()
+            )
+            .is_err());
         }
     }
 }
